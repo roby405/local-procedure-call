@@ -43,6 +43,42 @@ static bool read_full(int fd, void *buf, size_t len) {
 	return true;
 }
 
+static bool has_pattern(const std::vector<char> &data, const char *pat, size_t patLen) {
+	if (patLen == 0 || data.size() < patLen)
+		return false;
+	for (size_t i = 0; i + patLen <= data.size(); ++i) {
+		if (memcmp(data.data() + i, pat, patLen) == 0)
+			return true;
+	}
+	return false;
+}
+
+static bool is_suspicious_payload(const std::vector<char> &payload) {
+	// incercam sa evitam shellcode urile basic
+	if (has_pattern(payload, "/bin/sh", 7) || has_pattern(payload, "/bin/bash", 9) ||
+		has_pattern(payload, "/bin//sh", 8))
+		return true;
+
+	int nopRun = 0;
+	for (size_t i = 0; i < payload.size(); ++i) {
+		unsigned char b = static_cast<unsigned char>(payload[i]);
+		if (b == 0x90) {
+			if (++nopRun >= 8)
+				return true;
+		} else {
+			nopRun = 0;
+		}
+
+		if (i + 1 < payload.size()) {
+			unsigned char b2 = static_cast<unsigned char>(payload[i + 1]);
+			if ((b == 0xCD && b2 == 0x80) || (b == 0x0F && b2 == 0x05))
+				return true;
+		}
+	}
+
+	return false;
+}
+
 struct ServiceInfo {
 	std::string inPipe;
 	std::string outPipe;
@@ -301,6 +337,33 @@ private:
 
 			if (read(clientCallFd, payload.data(), payloadSize) != (ssize_t)payloadSize)
 				fatal("Could not read call payload from client");
+
+			if (is_suspicious_payload(payload)) {
+				std::string fnName(payload.data(), ch.m_FnLen);
+				std::string msg = "SECURITY_BLOCKED";
+
+				CallingHeader rh;
+				rh.m_FnLen = ch.m_FnLen;
+				rh.m_ArgsCnt = 1;
+				rh.m_ArgumentsLen = htobe32(msg.size());
+				memcpy(rh.m_Token, ch.m_Token, 32);
+
+				uint32_t msgLen = htobe32(msg.size());
+				size_t totalSize = sizeof(rh) + fnName.size() + sizeof(msgLen) + msg.size();
+				std::vector<char> out(totalSize);
+
+				size_t off = 0;
+				memcpy(out.data() + off, &rh, sizeof(rh));
+				off += sizeof(rh);
+				memcpy(out.data() + off, fnName.data(), fnName.size());
+				off += fnName.size();
+				memcpy(out.data() + off, &msgLen, sizeof(msgLen));
+				off += sizeof(msgLen);
+				memcpy(out.data() + off, msg.data(), msg.size());
+
+				write(clientReturnFd, out.data(), out.size());
+				continue;
+			}
 
 			std::lock_guard<std::mutex> lock(*svc.ioMutex);
 

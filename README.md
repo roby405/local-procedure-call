@@ -210,3 +210,20 @@ The dispatcher is implemented using the C programming language. If other languag
 
 **Important**
 The dispatcher does not create more than 600 pipes at any point during data transfer.
+
+### Implemented Bonus: Payload Security Checks
+
+The dispatcher scans each call payload and blocks suspicious content before forwarding it to a
+service. It looks for simple shellcode indicators like /bin/sh, /bin/bash, int 0x80 or syscall
+byte sequences, and NOP sleds. When blocked, the dispatcher replies with the same function name
+and a single argument: SECURITY_BLOCKED.
+
+#### How to test (after checker passes)
+
+1. Start the dispatcher and service (same steps as the checker).
+2. In tests/client-manager.cpp, set arg1 to /bin/sh.
+3. Rebuild tests (make in the tests folder).
+4. Run the client with 10 or more clients so it actually sends arguments.
+5. You should see SECURITY_BLOCKED in the client output.
+
+After testing, revert arg1 to arg1 so the checker stays clean.
