@@ -1,1 +1,7 @@
 dispatcher
+.pipes/
+.dispatcher/
+*.o
+dispatcher
+service
+client
