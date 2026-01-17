@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/uio.h>
 
 #include <cerrno>
 #include <cstring>
@@ -24,32 +25,33 @@ static void fatal(const char *msg) {
 }
 
 struct ServiceInfo {
-	std::string inPipe;   // where dispatcher writes calls, service reads
-	std::string outPipe;  // where service writes responses, dispatcher reads
+	std::string inPipe;
+	std::string outPipe;
 };
 
 class Dispatcher {
 public:
 	Dispatcher() {
-		// ensure directories exist
 		mkdir(".dispatcher", 0777);
 		mkdir(".pipes", 0777);
 
-		// recreate global FIFOs
 		mkfifo_safe(REQ_PIPE);
 		mkfifo_safe(INSTALL_REQ_PIPE);
 
-		// open with O_RDWR to avoid blocking/EOF issues
 		reqFd = open(REQ_PIPE, O_RDWR);
-		if (reqFd < 0) fatal("Could not open dispatcher request pipe");
+		if (reqFd < 0)
+			fatal("Could not open dispatcher request pipe");
 
 		installFd = open(INSTALL_REQ_PIPE, O_RDWR);
-		if (installFd < 0) fatal("Could not open install request pipe");
+		if (installFd < 0)
+			fatal("Could not open install request pipe");
 	}
 
 	~Dispatcher() {
-		if (reqFd >= 0) close(reqFd);
-		if (installFd >= 0) close(installFd);
+		if (reqFd >= 0)
+			close(reqFd);
+		if (installFd >= 0)
+			close(installFd);
 	}
 
 	void run() {
@@ -262,8 +264,13 @@ private:
 			if (read(clientCallFd, payload.data(), payloadSize) != (ssize_t)payloadSize)
 				fatal("Could not read call payload from client");
 
-			write(svcInFd, &ch, sizeof(ch));
-			write(svcInFd, payload.data(), payloadSize);
+			struct iovec iov[2];
+			iov[0].iov_base = &ch;
+			iov[0].iov_len = sizeof(ch);
+			iov[1].iov_base = payload.data();
+			iov[1].iov_len = payloadSize;
+
+			writev(svcInFd, iov, 2);
 
 			CallingHeader rh;
 			if (read(svcOutFd, &rh, sizeof(rh)) != (ssize_t)sizeof(rh))
@@ -276,8 +283,13 @@ private:
 			if (read(svcOutFd, resp.data(), respSize) != (ssize_t)respSize)
 				fatal("Could not read response payload from service");
 
-			write(clientReturnFd, &rh, sizeof(rh));
-			write(clientReturnFd, resp.data(), respSize);
+			struct iovec iov[2];
+			iov[0].iov_base = &rh;
+			iov[0].iov_len  = sizeof(rh);
+			iov[1].iov_base = resp.data();
+			iov[1].iov_len  = respSize;
+
+			writev(clientReturnFd, iov, 2);
 		}
 
 		close(clientCallFd);
