@@ -1,5 +1,5 @@
 DISPATCHER_NAME := dispatcher
-COMPILER=gcc
+COMPILER=g++
 
 all: build
 
@@ -8,8 +8,8 @@ build: $(DISPATCHER_NAME)
 $(DISPATCHER_NAME): dispatcher.o
 	$(COMPILER) -o $(DISPATCHER_NAME) dispatcher.o -lpthread
 
-dispatcher.o: dispatcher.c
-	$(COMPILER) -c dispatcher.c -o dispatcher.o
+dispatcher.o: dispatcher.cpp
+	$(COMPILER) -c dispatcher.cpp -o dispatcher.o
 
 run-dispatcher:
 	./$(DISPATCHER_NAME)
