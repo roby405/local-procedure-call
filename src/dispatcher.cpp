@@ -5,16 +5,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstring>
 #include <iostream>
 #include <string>
-#include <vector>
-#include <unordered_map>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "../src/protocol/components.h"
 
-#define REQ_PIPE         ".dispatcher/connection_req_pipe"
+#define REQ_PIPE ".dispatcher/connection_req_pipe"
 #define INSTALL_REQ_PIPE ".dispatcher/install_req_pipe"
 
 static void fatal(const char *msg) {
@@ -23,25 +24,26 @@ static void fatal(const char *msg) {
 }
 
 struct ServiceInfo {
-	std::string inPipe;
-	std::string outPipe;
+	std::string inPipe;   // where dispatcher writes calls, service reads
+	std::string outPipe;  // where service writes responses, dispatcher reads
 };
 
 class Dispatcher {
 public:
 	Dispatcher() {
-		// create dirs
+		// ensure directories exist
 		mkdir(".dispatcher", 0777);
 		mkdir(".pipes", 0777);
 
-		// global FIFOs
-		mkfifo(REQ_PIPE, 0666);
-		mkfifo(INSTALL_REQ_PIPE, 0666);
+		// recreate global FIFOs
+		mkfifo_safe(REQ_PIPE);
+		mkfifo_safe(INSTALL_REQ_PIPE);
 
-		reqFd = open(REQ_PIPE, O_RDONLY);
+		// open with O_RDWR to avoid blocking/EOF issues
+		reqFd = open(REQ_PIPE, O_RDWR);
 		if (reqFd < 0) fatal("Could not open dispatcher request pipe");
 
-		installFd = open(INSTALL_REQ_PIPE, O_RDONLY);
+		installFd = open(INSTALL_REQ_PIPE, O_RDWR);
 		if (installFd < 0) fatal("Could not open install request pipe");
 	}
 
@@ -52,8 +54,10 @@ public:
 
 	void run() {
 		std::cout << "[dispatcher] Waiting for service install..." << std::endl;
-		install_once();      // your current behavior: one service
-		connect_loop();      // then handle clients forever
+		// instalam serviciul in background
+		std::thread(&Dispatcher::install_loop, this).detach();
+		// stabilim o conexiune permanenta pentru serviciul clientului
+		connect_loop();
 	}
 
 private:
@@ -61,57 +65,73 @@ private:
 	int installFd{-1};
 	std::unordered_map<std::string, ServiceInfo> services;
 
-	void install_once() {
-		InstallRequestHeader ir;
-		ssize_t n = read(installFd, &ir, sizeof(ir));
-		if (n != sizeof(ir))
-			fatal("Could not read InstallRequestHeader");
+	void mkfifo_safe(const std::string &path) {
+		unlink(path.c_str());
+		if (mkfifo(path.c_str(), 0666) < 0 && errno != EEXIST)
+			fatal(("mkfifo failed for " + path).c_str());
+	}
 
-		uint16_t ipnLen = be16toh(ir.m_IpnLen);
-		std::vector<char> buf(ipnLen);
+	void install_loop() {
+		while (true) {
+			InstallRequestHeader ir;
+			ssize_t n = read(installFd, &ir, sizeof(ir));
 
-		if (read(installFd, buf.data(), buf.size()) != (ssize_t)buf.size())
-			fatal("Could not read install pipe name");
+			if (n == 0) {
+				close(installFd);
+				installFd = open(INSTALL_REQ_PIPE, O_RDWR);
+				if (installFd < 0) fatal("Could not reopen install request pipe");
+				continue;
+			}
 
-		std::string installPipeName(buf.data(), ipnLen);
-		std::cout << "[dispatcher] Install request on pipe: "
-				  << installPipeName << std::endl;
+			if (n != (ssize_t)sizeof(ir))
+				fatal("Could not read InstallRequestHeader");
 
-		mkfifo(installPipeName.c_str(), 0666);
+			uint16_t ipnLen = be16toh(ir.m_IpnLen);
+			std::vector<char> buf(ipnLen);
 
-		int sfd = open(installPipeName.c_str(), O_RDONLY);
-		if (sfd < 0)
-			fatal("Could not open service install pipe");
+			if (read(installFd, buf.data(), buf.size()) != (ssize_t)buf.size())
+				fatal("Could not read install pipe name");
 
-		InstallHeader hdr;
-		if (read(sfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr))
-			fatal("Could not read InstallHeader");
+			std::string installPipeName(buf.data(), ipnLen);
+			std::cout << "[dispatcher] Install request on pipe: "
+					  << installPipeName << std::endl;
 
-		uint16_t vLen   = hdr.m_VersionLen;
-		uint16_t cpnLen = be16toh(hdr.m_CpnLen);
-		uint16_t rpnLen = be16toh(hdr.m_RpnLen);
-		uint16_t apLen  = be16toh(hdr.m_ApLen);
+			mkfifo_safe(installPipeName);
 
-		std::vector<char> buf2(vLen + cpnLen + rpnLen + apLen);
-		if (read(sfd, buf2.data(), buf2.size()) != (ssize_t)buf2.size())
-			fatal("Could not read install payload");
+			int sfd = open(installPipeName.c_str(), O_RDONLY);
+			if (sfd < 0)
+				fatal("Could not open service install pipe");
 
-		size_t off = 0;
-		std::string version(buf2.data() + off, vLen); off += vLen;
-		std::string inPipe(buf2.data() + off, cpnLen); off += cpnLen;
-		std::string outPipe(buf2.data() + off, rpnLen); off += rpnLen;
-		std::string accessPath(buf2.data() + off, apLen);
+			InstallHeader hdr;
+			if (read(sfd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr))
+				fatal("Could not read InstallHeader");
 
-		mkfifo(inPipe.c_str(), 0666);
-		mkfifo(outPipe.c_str(), 0666);
+			uint16_t vLen   = hdr.m_VersionLen;
+			uint16_t cpnLen = be16toh(hdr.m_CpnLen);
+			uint16_t rpnLen = be16toh(hdr.m_RpnLen);
+			uint16_t apLen  = be16toh(hdr.m_ApLen);
 
-		std::cout << "[dispatcher] Installed service: AP=" << accessPath
-				  << " inPipe=" << inPipe << " outPipe=" << outPipe
-				  << " version=" << version << std::endl;
+			std::vector<char> buf2(vLen + cpnLen + rpnLen + apLen);
+			if (read(sfd, buf2.data(), buf2.size()) != (ssize_t)buf2.size())
+				fatal("Could not read install payload");
 
-		services[accessPath] = { inPipe, outPipe };
+			size_t off = 0;
+			std::string version(buf2.data() + off, vLen);   off += vLen;
+			std::string inPipe(buf2.data() + off, cpnLen);  off += cpnLen;
+			std::string outPipe(buf2.data() + off, rpnLen); off += rpnLen;
+			std::string accessPath(buf2.data() + off, apLen);
 
-		close(sfd);
+			mkfifo_safe(inPipe);
+			mkfifo_safe(outPipe);
+
+			std::cout << "[dispatcher] Installed service: AP=" << accessPath
+					  << " inPipe=" << inPipe << " outPipe=" << outPipe
+					  << " version=" << version << std::endl;
+
+			services[accessPath] = { inPipe, outPipe };
+
+			close(sfd);
+		}
 	}
 
 	void connect_loop() {
@@ -123,14 +143,17 @@ private:
 			ssize_t n = read(reqFd, &hdr, sizeof(hdr));
 			if (n == 0) {
 				close(reqFd);
-				reqFd = open(REQ_PIPE, O_RDONLY);
+				reqFd = open(REQ_PIPE, O_RDWR);
+
+				if (reqFd < 0)
+					fatal("Could not reopen dispatcher request pipe");
 				continue;
 			}
-			if (n != sizeof(hdr))
+			if (n != (ssize_t)sizeof(hdr))
 				fatal("Could not read ConnectionRequestHeader");
 
 			uint32_t rpnLen = be32toh(hdr.m_RpnLen);
-			uint32_t apLen  = be32toh(hdr.m_ApLen);
+			uint32_t apLen = be32toh(hdr.m_ApLen);
 
 			std::vector<char> buf(rpnLen + apLen);
 			if (read(reqFd, buf.data(), buf.size()) != (ssize_t)buf.size())
@@ -151,23 +174,21 @@ private:
 
 			ServiceInfo svc = it->second;
 
-			std::string callPipe   = ".pipes/call_"   + std::to_string(clientIdx);
+			std::string callPipe   = ".pipes/call_" + std::to_string(clientIdx);
 			std::string returnPipe = ".pipes/return_" + std::to_string(clientIdx);
 
-			mkfifo(callPipe.c_str(), 0666);
-			mkfifo(returnPipe.c_str(), 0666);
+			mkfifo_safe(callPipe);
+			mkfifo_safe(returnPipe);
 
 			std::string version = "v1";
 
 			ConnectHeader ch;
 			ch.m_VersionLen = version.size();
-			ch.m_CpnLen     = htobe32(callPipe.size());
-			ch.m_RpnLen     = htobe32(returnPipe.size());
+			ch.m_CpnLen = htobe32(callPipe.size());
+			ch.m_RpnLen = htobe32(returnPipe.size());
 
-			size_t totalSize = sizeof(ch) +
-							   version.size() +
-							   callPipe.size() +
-							   returnPipe.size();
+			size_t totalSize = sizeof(ch) + version.size() +
+							   callPipe.size() + returnPipe.size();
 
 			std::vector<char> out(totalSize);
 
@@ -187,7 +208,7 @@ private:
 			std::string connectPipe = std::string(".pipes/connect_pipe") +
 									  std::to_string(clientIdx);
 
-			mkfifo(connectPipe.c_str(), 0666);
+			mkfifo_safe(connectPipe);
 
 			int cfd = open(connectPipe.c_str(), O_WRONLY);
 			if (cfd < 0) fatal("Could not open client connect pipe");
