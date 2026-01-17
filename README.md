@@ -245,3 +245,32 @@ This keeps compatibility with the checker while allowing extra robustness data.
 4. You should see no warnings; if checksum is wrong, dispatcher logs a mismatch.
 
 After testing, revert tests/service.cpp to keep the checker clean.
+
+
+
+
+local-procedure-call Implementation README
+Baran Denis-Constantin
+Epure Roberto-Constantin
+
+For the have decided to use C++ because we were both used to programming in it, although not really at an advanced level.
+
+Explanations of Basic Functionality
+
+#using mkfifo for creating all the needed pipes:
+We have two functions for this inside the Dispatcher class, mkfifo_safe and mkfifo_if_missing. Both use the mkfifo syscall. Only difference between them is unlinking first for the safe version.
+In the Dispatcher constructor, we make the connection and install request pipes.
+Now during the thread for installing, we have another mkfifo pipe creation for each install header+contents. Afterwards, again for that install header+contents, we make an input and an output pipe.
+We also create pipes for each ConnectionRequestHeader+contents. Afterwards, we open two more, one for calls and one for returns. with the name .pipes/call_[clientIndex], respectively .pipes/return_[clientIndex].
+
+#creating two pipes between the dispatcher and each entity (an entity is a server or a client) with the proper permissions (each server can write or read, NOT BOTH from its own pipes without); while implementing and testing the permissions can be more permissive but the final solution should have only the minimum permissions when creating each pipe
+-the dispatcher pipes should be created inside the .dispatcher directory and every entity pipes should be created inside the .pipes directory
+-the pipe used for install requests must be called install_req_pipe and the pipe used for connect requests must be called connection_req_pipe; both pipes should be created in the .dispatcher directory:
+
+The minimum permissions found by us through testing have been 0620.
+We used two constants for the names of connection and install pipes through REQ_PIPE and INSTALL_REQ_PIPE, which, as said before, were set up in the constructor for the dispatcher. We also have a few error checks if fd < 0.
+Individual pipes for entities were created inside the connect_loop function in .pipes/ folder.
+
+we also made fast transfer between server and client using a two element array with iovec structs for both calls and responses.
+We didn't modify any other files except some comments in clientManager and the line that was mentioned on Teams for components.h
+We only had one service in the end.
