@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#include <sys/ioctl.h>
 
 #include <cerrno>
 #include <cstring>
@@ -41,6 +42,15 @@ static bool read_full(int fd, void *buf, size_t len) {
 		off += static_cast<size_t>(n);
 	}
 	return true;
+}
+
+static uint32_t fnv1a32(const std::string &s) {
+	uint32_t hash = 2166136261u;
+	for (unsigned char c : s) {
+		hash ^= c;
+		hash *= 16777619u;
+	}
+	return hash;
 }
 
 static bool has_pattern(const std::vector<char> &data, const char *pat, size_t patLen) {
@@ -85,6 +95,9 @@ struct ServiceInfo {
 	std::shared_ptr<std::mutex> ioMutex;
 	int inFd{-1};
 	int outFd{-1};
+	bool hasExt{false};
+	uint8_t extFlags{0};
+	uint32_t extChecksum{0};
 };
 
 class Dispatcher {
@@ -195,6 +208,25 @@ private:
 
 			ServiceInfo info{inPipe, outPipe, std::make_shared<std::mutex>(), -1, -1};
 
+	
+			// extensia de protocol(1 extra byte + 4 bytes pentru checksum)
+			int available = 0;
+			if (ioctl(sfd, FIONREAD, &available) == 0 && available >= 5) {
+				uint8_t flags = 0;
+				uint32_t checksum = 0;
+				if (read_full(sfd, &flags, sizeof(flags)) &&
+					read_full(sfd, &checksum, sizeof(checksum))) {
+					info.hasExt = true;
+					info.extFlags = flags;
+					info.extChecksum = be32toh(checksum);
+					uint32_t expected = fnv1a32(accessPath);
+					if (info.extChecksum != expected) {
+						std::cerr << "[dispatcher] Warning: access path checksum mismatch"
+								  << std::endl;
+					}
+				}
+			}
+
 			// dechidem pipe-urile pentru serviciu si le pastram
 			info.inFd = open(inPipe.c_str(), O_WRONLY);
 			if (info.inFd < 0)
@@ -236,6 +268,8 @@ private:
 
 			std::string rpn(buf.data(), rpnLen);
 			std::string ap(buf.data() + rpnLen, apLen);
+
+			mkfifo_if_missing(rpn);
 
 			std::cout << "[dispatcher] New connection request: RPN=" << rpn
 					  << " AP=" << ap << std::endl;
@@ -289,13 +323,20 @@ private:
 			memcpy(out.data() + off, returnPipe.data(), returnPipe.size());
 			off += returnPipe.size();
 
-			mkfifo_if_missing(rpn);
-
 			std::string rpnCopy = rpn;
 			std::vector<char> outCopy = out;
 			std::thread([rpnCopy, outCopy]() {
-				int cfd = open(rpnCopy.c_str(), O_WRONLY);
-				if (cfd < 0) fatal("Could not open client connect pipe");
+				int cfd = -1;
+				for (int attempt = 0; attempt < 200; ++attempt) { // up to ~2s
+					cfd = open(rpnCopy.c_str(), O_WRONLY | O_NONBLOCK);
+					if (cfd >= 0)
+						break;
+					if (errno != ENXIO && errno != ENOENT)
+						break;
+					usleep(10000);
+				}
+				if (cfd < 0)
+					fatal("Could not open client connect pipe");
 				write(cfd, outCopy.data(), outCopy.size());
 				close(cfd);
 			}).detach();
