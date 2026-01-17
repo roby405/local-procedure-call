@@ -13,6 +13,8 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <memory>
+#include <mutex>
 
 #include "../src/protocol/components.h"
 
@@ -24,9 +26,29 @@ static void fatal(const char *msg) {
 	exit(1);
 }
 
+static bool read_full(int fd, void *buf, size_t len) {
+	char *p = static_cast<char *>(buf);
+	size_t off = 0;
+	while (off < len) {
+		ssize_t n = read(fd, p + off, len - off);
+		if (n == 0)
+			return false;
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		off += static_cast<size_t>(n);
+	}
+	return true;
+}
+
 struct ServiceInfo {
 	std::string inPipe;
 	std::string outPipe;
+	std::shared_ptr<std::mutex> ioMutex;
+	int inFd{-1};
+	int outFd{-1};
 };
 
 class Dispatcher {
@@ -69,6 +91,11 @@ private:
 
 	void mkfifo_safe(const std::string &path) {
 		unlink(path.c_str());
+		if (mkfifo(path.c_str(), 0666) < 0 && errno != EEXIST)
+			fatal(("mkfifo failed for " + path).c_str());
+	}
+
+	void mkfifo_if_missing(const std::string &path) {
 		if (mkfifo(path.c_str(), 0666) < 0 && errno != EEXIST)
 			fatal(("mkfifo failed for " + path).c_str());
 	}
@@ -130,7 +157,17 @@ private:
 					  << " inPipe=" << inPipe << " outPipe=" << outPipe
 					  << " version=" << version << std::endl;
 
-			services[accessPath] = { inPipe, outPipe };
+			ServiceInfo info{inPipe, outPipe, std::make_shared<std::mutex>(), -1, -1};
+
+			// dechidem pipe-urile pentru serviciu si le pastram
+			info.inFd = open(inPipe.c_str(), O_WRONLY);
+			if (info.inFd < 0)
+				fatal("Could not open service input pipe");
+
+			info.outFd = open(outPipe.c_str(), O_RDONLY);
+			if (info.outFd < 0)
+				fatal("Could not open service output pipe");
+			services[accessPath] = info;
 
 			close(sfd);
 		}
@@ -167,14 +204,23 @@ private:
 			std::cout << "[dispatcher] New connection request: RPN=" << rpn
 					  << " AP=" << ap << std::endl;
 
-			auto it = services.find(ap);
-			if (it == services.end()) {
+			// daca serviciul nu e instalat asteapteptam dupa el
+			ServiceInfo svc;
+			bool found = false;
+			for (int tries = 0; tries < 200; ++tries) { // incearca aproximativ 2 secunde
+				auto it = services.find(ap);
+				if (it != services.end()) {
+					svc = it->second;
+					found = true;
+					break;
+				}
+				usleep(10000);
+			}
+			if (!found) {
 				std::cerr << "[dispatcher] No service for access path: "
 						  << ap << std::endl;
 				continue;
 			}
-
-			ServiceInfo svc = it->second;
 
 			std::string callPipe   = ".pipes/call_" + std::to_string(clientIdx);
 			std::string returnPipe = ".pipes/return_" + std::to_string(clientIdx);
@@ -207,16 +253,16 @@ private:
 			memcpy(out.data() + off, returnPipe.data(), returnPipe.size());
 			off += returnPipe.size();
 
-			std::string connectPipe = std::string(".pipes/connect_pipe") +
-									  std::to_string(clientIdx);
+			mkfifo_if_missing(rpn);
 
-			mkfifo_safe(connectPipe);
-
-			int cfd = open(connectPipe.c_str(), O_WRONLY);
-			if (cfd < 0) fatal("Could not open client connect pipe");
-
-			write(cfd, out.data(), out.size());
-			close(cfd);
+			std::string rpnCopy = rpn;
+			std::vector<char> outCopy = out;
+			std::thread([rpnCopy, outCopy]() {
+				int cfd = open(rpnCopy.c_str(), O_WRONLY);
+				if (cfd < 0) fatal("Could not open client connect pipe");
+				write(cfd, outCopy.data(), outCopy.size());
+				close(cfd);
+			}).detach();
 
 			std::cout << "[dispatcher] Sent connect response to client "
 					  << clientIdx << std::endl;
@@ -239,14 +285,6 @@ private:
 		if (clientReturnFd < 0)
 			fatal("Could not open client return pipe");
 
-		int svcInFd = open(svc.inPipe.c_str(), O_WRONLY);
-		if (svcInFd < 0)
-			fatal("Could not open service input pipe");
-
-		int svcOutFd = open(svc.outPipe.c_str(), O_RDONLY);
-		if (svcOutFd < 0)
-			fatal("Could not open service output pipe");
-
 		while (true) {
 			CallingHeader ch;
 			ssize_t n = read(clientCallFd, &ch, sizeof(ch));
@@ -264,38 +302,38 @@ private:
 			if (read(clientCallFd, payload.data(), payloadSize) != (ssize_t)payloadSize)
 				fatal("Could not read call payload from client");
 
-			struct iovec iov[2];
-			iov[0].iov_base = &ch;
-			iov[0].iov_len = sizeof(ch);
-			iov[1].iov_base = payload.data();
-			iov[1].iov_len = payloadSize;
+			std::lock_guard<std::mutex> lock(*svc.ioMutex);
 
-			writev(svcInFd, iov, 2);
+			struct iovec iov_call[2];
+			iov_call[0].iov_base = &ch;
+			iov_call[0].iov_len = sizeof(ch);
+			iov_call[1].iov_base = payload.data();
+			iov_call[1].iov_len = payloadSize;
+
+			writev(svc.inFd, iov_call, 2);
 
 			CallingHeader rh;
-			if (read(svcOutFd, &rh, sizeof(rh)) != (ssize_t)sizeof(rh))
+			if (!read_full(svc.outFd, &rh, sizeof(rh)))
 				fatal("Could not read CallingHeader from service");
 
 			uint32_t rArgsLen = be32toh(rh.m_ArgumentsLen);
 			size_t respSize = rh.m_FnLen + 4 * rh.m_ArgsCnt + rArgsLen;
 			std::vector<char> resp(respSize);
 
-			if (read(svcOutFd, resp.data(), respSize) != (ssize_t)respSize)
+			if (!read_full(svc.outFd, resp.data(), respSize))
 				fatal("Could not read response payload from service");
 
-			struct iovec iov[2];
-			iov[0].iov_base = &rh;
-			iov[0].iov_len  = sizeof(rh);
-			iov[1].iov_base = resp.data();
-			iov[1].iov_len  = respSize;
+			struct iovec iov_resp[2];
+			iov_resp[0].iov_base = &rh;
+			iov_resp[0].iov_len  = sizeof(rh);
+			iov_resp[1].iov_base = resp.data();
+			iov_resp[1].iov_len  = respSize;
 
-			writev(clientReturnFd, iov, 2);
+			writev(clientReturnFd, iov_resp, 2);
 		}
 
 		close(clientCallFd);
 		close(clientReturnFd);
-		close(svcInFd);
-		close(svcOutFd);
 	}
 };
 
