@@ -52,5 +52,6 @@ The Dispatcher acts as the central orchestration layer:
     Navigate to the `checker/` directory and execute `./run_tests.sh`.
 
 ---
-**Developers:** - Baran Denis-Constantin
+**Developers:** 
+- Baran Denis-Constantin
 - Epure Roberto-Constantin
